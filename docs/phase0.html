@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f0f12">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Crate検証">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<title>Crate Phase 0 検証</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: calc(env(safe-area-inset-top) + 12px) 16px calc(env(safe-area-inset-bottom) + 24px); background: #0f0f12; color: #f2f2f5; font: 16px/1.5 -apple-system, "Hiragino Sans", sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.sub { color: #9a9aa8; font-size: 13px; margin: 0 0 14px; }
+  label { display: block; font-size: 13px; color: #9a9aa8; margin: 10px 0 4px; }
+  input { width: 100%; box-sizing: border-box; height: 46px; padding: 0 12px; border-radius: 10px; border: 1px solid #2a2a33; background: #202027; color: #f2f2f5; font-size: 16px; }
+  .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0; }
+  button { min-height: 46px; border-radius: 23px; border: 0; background: #2a2a33; color: #f2f2f5; font-size: 15px; font-weight: 600; }
+  button.primary { background: #f2a93b; color: #1c1306; grid-column: 1 / -1; }
+  .now { padding: 12px; border-radius: 12px; background: #17171c; margin: 12px 0; }
+  .now b { display: block; font-size: 17px; }
+  .now span { color: #9a9aa8; font-size: 13px; font-variant-numeric: tabular-nums; }
+  #log { white-space: pre-wrap; font: 12px/1.5 ui-monospace, Menlo, monospace; background: #17171c; border-radius: 12px; padding: 10px; min-height: 120px; }
+  .ok { color: #7ddc8a; } .ng { color: #ff6b6b; }
+  ol { padding-left: 20px; color: #c8c8d0; font-size: 14px; }
+</style>
+</head>
+<body>
+<h1>Crate Phase 0 検証</h1>
+<p class="sub">非公開リポジトリの曲を Worker 経由で流せるかを確かめるページです（本番の画面ではありません）。</p>
+
+<label>Worker の URL</label>
+<input id="worker" autocomplete="off" autocapitalize="off" spellcheck="false">
+<label>合言葉</label>
+<input id="key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false">
+
+<div class="btns">
+  <button class="primary" id="start">① テスト開始（3曲を順に再生）</button>
+  <button id="seek">② 2分先へシーク</button>
+  <button id="nearEnd">③ 終わり10秒前へ</button>
+  <button id="next">次の曲へ</button>
+  <button id="toggle">一時停止／再開</button>
+  <button id="copy" class="primary">結果をコピー</button>
+</div>
+
+<div class="now"><b id="title">—</b><span id="pos">0:00 / 0:00</span><br><span id="expiry"></span></div>
+
+<ol>
+  <li>①を押して、最初の音が鳴るまでの時間を見る</li>
+  <li>②でシークの速さを見る</li>
+  <li>③を押してから画面を消し、ロック画面のまま3曲続けて送られるか聞く</li>
+  <li>一時停止して2分以上待ち、再開する（期限切れからの復帰）</li>
+  <li>Wi‑Fi を切って、モバイル回線のまま鳴り続けるか</li>
+  <li>終わったら「結果をコピー」して貼り付けてください</li>
+</ol>
+<div id="log"></div>
+
+<audio id="a" preload="auto" playsinline></audio>
+<script>
+const FILES = ['test-10mb.mp3', 'test-moov-end.m4a', 'test-40mb.mp3'];
+const $ = (id) => document.getElementById(id);
+const a = $('a');
+const t0 = performance.now();
+let urls = {}, gotAt = 0, ttl = 0, idx = 0, loadStart = 0, seekStart = 0, retried = false;
+
+$('worker').value = localStorage.getItem('crate.workerUrl') || 'https://crate-api.nagi-life-5s.workers.dev';
+$('key').value = localStorage.getItem('crate.key') ? JSON.parse(localStorage.getItem('crate.key')) : '';
+
+function log(msg, cls = '') {
+  const s = ((performance.now() - t0) / 1000).toFixed(1).padStart(6);
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = `${s}s ${msg}`;
+  $('log').prepend(line);
+}
+const fmt = (x) => isFinite(x) ? Math.floor(x / 60) + ':' + String(Math.floor(x % 60)).padStart(2, '0') : '--:--';
+
+async function call(fn, args = []) {
+  const w = $('worker').value.trim().replace(/\/$/, '');
+  const r = await fetch(w + '/api/' + fn, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Crate-Key': encodeURIComponent($('key').value) },
+    body: JSON.stringify({ args }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j.result;
+}
+
+async function refreshUrls() {
+  const t = performance.now();
+  const r = await call('streamUrls', [FILES]);
+  urls = r.urls; ttl = r.ttl; gotAt = performance.now();
+  log(`URL を取得（${Math.round(performance.now() - t)}ms、期限 ${ttl}秒）`);
+}
+
+function load(i, at = 0) {
+  idx = (i + FILES.length) % FILES.length;
+  retried = false;
+  loadStart = performance.now();
+  a.src = urls[FILES[idx]];
+  if (at) a.addEventListener('loadedmetadata', () => { a.currentTime = at; }, { once: true });
+  $('title').textContent = FILES[idx];
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.metadata = new MediaMetadata({ title: FILES[idx], artist: 'Crate Phase 0', album: 'Crate' });
+  }
+  log(`読み込み開始: ${FILES[idx]}`);
+  return a.play().catch((e) => log('play() 失敗: ' + e.name + ' ' + e.message, 'ng'));
+}
+
+$('start').onclick = async () => {
+  localStorage.setItem('crate.workerUrl', $('worker').value.trim());
+  localStorage.setItem('crate.key', JSON.stringify($('key').value));
+  try {
+    await call('checkKey');
+    log('合言葉 OK', 'ok');
+    await refreshUrls();
+    load(0);
+  } catch (e) { log('失敗: ' + e.message, 'ng'); }
+};
+$('seek').onclick = () => { seekStart = performance.now(); a.currentTime = Math.min((a.currentTime || 0) + 120, (a.duration || 0) - 5); };
+$('nearEnd').onclick = () => { seekStart = performance.now(); a.currentTime = Math.max(0, (a.duration || 0) - 10); };
+$('next').onclick = () => load(idx + 1);
+$('toggle').onclick = async () => {
+  if (a.paused) {
+    // 期限切れが近ければ、同じ位置から新しい URL で読み込み直す（本番と同じ考え方）
+    if ((performance.now() - gotAt) / 1000 > ttl - 10) {
+      log('期限が近いので URL を取り直して再開');
+      const at = a.currentTime;
+      await refreshUrls();
+      load(idx, at);
+    } else a.play();
+  } else a.pause();
+};
+$('copy').onclick = async () => {
+  const text = [...$('log').children].reverse().map((d) => d.textContent).join('\n')
+    + `\n---\n${navigator.userAgent}\nstandalone=${window.navigator.standalone === true}`;
+  try { await navigator.clipboard.writeText(text); alert('コピーしました'); }
+  catch { prompt('コピーできなかったので、ここから手で選んでください', text); }
+};
+
+a.addEventListener('playing', () => {
+  if (loadStart) { const ms = Math.round(performance.now() - loadStart); log(`最初の音まで ${ms}ms`, ms <= 2000 ? 'ok' : 'ng'); loadStart = 0; }
+  else log('再生');
+});
+a.addEventListener('seeked', () => {
+  if (!seekStart) return;
+  const ms = Math.round(performance.now() - seekStart);
+  log(`シーク ${ms}ms`, ms <= 1000 ? 'ok' : 'ng');
+  seekStart = 0;
+});
+a.addEventListener('pause', () => { if (!a.ended) log('一時停止' + (document.hidden ? '（画面オフ中）' : '')); });
+a.addEventListener('ended', () => { log(`曲の終わり（画面${document.hidden ? 'オフ' : 'オン'}）→ 次へ`, 'ok'); load(idx + 1); });
+a.addEventListener('stalled', () => log('通信が止まっている（stalled）'));
+a.addEventListener('waiting', () => log('バッファ待ち'));
+a.addEventListener('error', async () => {
+  const code = a.error ? a.error.code : '?';
+  log(`エラー（code=${code}）`, 'ng');
+  if (retried) { log('取り直しても失敗。次の曲へ', 'ng'); load(idx + 1); return; }
+  retried = true;
+  const at = a.currentTime;
+  try { await refreshUrls(); log('URL を取り直して1回だけやり直し'); const r = retried; load(idx, at); retried = r; }
+  catch (e) { log('取り直し失敗: ' + e.message, 'ng'); }
+});
+document.addEventListener('visibilitychange', () => log(document.hidden ? '画面が裏に回った' : '画面が戻った'));
+if ('mediaSession' in navigator) {
+  const ms = navigator.mediaSession;
+  ms.setActionHandler('play', () => a.play());
+  ms.setActionHandler('pause', () => a.pause());
+  ms.setActionHandler('nexttrack', () => load(idx + 1));
+  ms.setActionHandler('previoustrack', () => load(idx - 1));
+}
+setInterval(() => {
+  $('pos').textContent = `${fmt(a.currentTime)} / ${fmt(a.duration)}`;
+  if (gotAt) {
+    const left = Math.round(ttl - (performance.now() - gotAt) / 1000);
+    $('expiry').textContent = left > 0 ? `URL の期限まであと ${left}秒` : 'URL の期限切れ';
+  }
+}, 500);
+</script>
+</body>
+</html>

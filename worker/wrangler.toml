@@ -1,0 +1,11 @@
+name = "crate-api"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+[vars]
+# 画面の置き場所（カンマ区切りで複数可。localhost は常に許可）
+ALLOWED_ORIGIN = "https://nagilife5s.github.io"
+GH_REPO = "nagilife5s/crate-library"
+GH_BRANCH = "main"
+# 期限付きURLの有効秒数。Phase 0 の期限切れテスト中は 120。本番は 604800（7日）に戻す
+URL_TTL_SEC = "120"
