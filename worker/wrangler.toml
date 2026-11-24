@@ -7,5 +7,5 @@ compatibility_date = "2026-09-01"
 ALLOWED_ORIGIN = "https://nagilife5s.github.io"
 GH_REPO = "nagilife5s/crate-library"
 GH_BRANCH = "main"
-# 期限付きURLの有効秒数。Phase 0 の期限切れテスト中は 120。本番は 604800（7日）に戻す
-URL_TTL_SEC = "120"
+# 期限付きURLの有効秒数（7日。Phase 0 の期限切れテストでは 120 にした）
+URL_TTL_SEC = "604800"
