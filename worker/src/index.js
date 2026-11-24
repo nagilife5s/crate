@@ -16,11 +16,19 @@
  * 変数（wrangler.toml の [vars]）:
  *   ALLOWED_ORIGIN / GH_REPO / GH_BRANCH / URL_TTL_SEC
  *
- * 2026-11-24 Phase 0: checkKey / streamUrls / 曲の中継 だけ。
- * 取り先は raw.githubusercontent.com（api.github.com の raw は Range を無視して丸ごと返すため。Phase 0 で確認）。
+ * 窓口: checkKey / loadLibrary / saveLibrary / streamUrls / ytMeta ／ GET /s/…（曲の中継）
+ * 曲の取り先は raw.githubusercontent.com（api.github.com の raw は Range を無視して丸ごと返すため。Phase 0 で確認）。
+ * 一覧（library.json）の読み書きは GitHub Contents API。
+ *
+ * 保存の決まり（設計メモ｜裏側.md）:
+ *   ・使うのは1人なので、別の端末と食い違っても「画面の内容」を正にする（409 で止めない）
+ *   ・ただしアプリからは消せない「自分の曲」（kind:file）は、サーバーにあって画面に無ければ足し戻す
+ *     （Mac から曲を追加した後に、古い一覧のまま保存されても曲が消えないように）
+ *   ・曲が急に半分以下に減る保存や、形の壊れた一覧は弾く
  */
 
-const PUBLIC_FNS = ['checkKey', 'streamUrls'];
+const PUBLIC_FNS = ['checkKey', 'loadLibrary', 'saveLibrary', 'streamUrls', 'ytMeta'];
+const SCHEMA_VERSION = 1;
 const FILE_RE = /^[\w-]+\.(mp3|m4a)$/;
 const TYPES = { mp3: 'audio/mpeg', m4a: 'audio/mp4' };
 
@@ -57,7 +65,9 @@ export default {
       return json_({ result: result === undefined ? null : result }, 200, cors);
     } catch (e) {
       console.error('[' + fn + '] ' + String((e && e.message) || e));
-      return json_({ error: String((e && e.message) || e).slice(0, 500) }, 500, cors);
+      const body = { error: String((e && e.message) || e).slice(0, 500) };
+      if (e && e.code) body.code = e.code;
+      return json_(body, (e && e.status) || 500, cors);
     }
   },
 };
@@ -79,7 +89,127 @@ const API = {
     }
     return { urls: out, ttl, exp };
   },
+
+  /** 一覧を読む。期限付きURLは一覧に混ぜず urls として別に返す（一覧にURLがコミットされないように） */
+  async loadLibrary(env, url) {
+    const cur = await readLibrary_(env);
+    const files = cur.lib.tracks.filter((t) => t.kind === 'file').map((t) => t.ref);
+    const s = await API.streamUrls(env, url, files);
+    return { lib: cur.lib, sha: cur.sha, urls: s.urls, ttl: s.ttl, exp: s.exp };
+  },
+
+  /** 一覧を保存する。戻り値 { sha, lib: 足し戻した曲があれば保存した一覧（無ければ null）, restored: 足し戻した曲数 } */
+  async saveLibrary(env, url, lib, baseSha) {
+    const next = cleanLibrary_(lib);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const cur = await readLibrary_(env);
+      // サーバーにあって画面に無い「自分の曲」を足し戻す
+      const have = new Set(next.tracks.map((t) => t.id));
+      const missing = cur.lib.tracks.filter((t) => t.kind === 'file' && !have.has(t.id));
+      const merged = missing.length ? { ...next, tracks: [...next.tracks, ...missing] } : next;
+      // 曲が急に減っていないか
+      if (cur.lib.tracks.length >= 6 && merged.tracks.length < cur.lib.tracks.length / 2) {
+        throw httpError_(`曲の数が ${cur.lib.tracks.length} → ${merged.tracks.length} に急に減るので、保存を止めました`, 422, 'too_many_removed');
+      }
+      const res = await gh_(env, 'contents/library.json', {
+        method: 'PUT',
+        body: JSON.stringify({
+          message: 'Crate: 一覧を保存' + (missing.length ? `（自分の曲 ${missing.length} 件を足し戻し）` : ''),
+          content: utf8ToB64_(JSON.stringify(merged, null, 2) + '\n'),
+          branch: env.GH_BRANCH || 'main',
+          ...(cur.sha ? { sha: cur.sha } : {}),
+        }),
+      });
+      if (res.status === 409 || res.status === 422) continue; // 読んでから書くまでに先を越された → 読み直す
+      if (!res.ok) throw await ghError_(res, '一覧の保存');
+      const j = await res.json();
+      return { sha: j.content.sha, lib: missing.length ? merged : null, restored: missing.length, conflict: !!(baseSha && cur.sha && baseSha !== cur.sha) };
+    }
+    throw httpError_('一覧の保存が3回続けて競合しました。少し待って、もう一度試してください', 409, 'conflict');
+  },
+
+  /** YouTube の曲名とチャンネル名（oEmbed） */
+  async ytMeta(env, url, videoId) {
+    if (!/^[\w-]{11}$/.test(String(videoId || ''))) throw httpError_('動画IDが正しくありません', 400, 'bad_id');
+    const watch = 'https://www.youtube.com/watch?v=' + videoId;
+    const res = await fetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent(watch), { headers: { 'User-Agent': 'crate-api' } });
+    if (res.status === 401 || res.status === 403) throw httpError_('埋め込みが許可されていない動画です', 422, 'not_embeddable');
+    if (res.status === 404 || res.status === 400) throw httpError_('動画が見つかりません（削除・非公開）', 404, 'not_found');
+    if (!res.ok) throw httpError_('YouTube から曲名を取れませんでした（' + res.status + '）', 502, 'upstream');
+    const j = await res.json();
+    return { title: String(j.title || ''), author: String(j.author_name || '') };
+  },
 };
+
+// ============ 一覧（library.json） ============
+async function readLibrary_(env) {
+  const res = await gh_(env, 'contents/library.json?ref=' + encodeURIComponent(env.GH_BRANCH || 'main'));
+  if (res.status === 404) return { lib: { schemaVersion: SCHEMA_VERSION, tracks: [], playlists: [] }, sha: null };
+  if (!res.ok) throw await ghError_(res, '一覧の読み込み');
+  const j = await res.json();
+  let lib;
+  try { lib = JSON.parse(b64ToUtf8_(j.content || '')); } catch (e) { throw httpError_('library.json が壊れています（JSON として読めない）', 500, 'broken'); }
+  return { lib: cleanLibrary_(lib), sha: j.sha };
+}
+
+/** 形を確かめ、決めた項目だけを残す（実行時の印や URL が混ざってもコミットしない） */
+function cleanLibrary_(lib) {
+  if (!lib || lib.schemaVersion !== SCHEMA_VERSION || !Array.isArray(lib.tracks) || !Array.isArray(lib.playlists)) {
+    throw httpError_('一覧の形が正しくありません（schemaVersion / tracks / playlists）', 422, 'bad_library');
+  }
+  if (lib.tracks.length > 2000 || lib.playlists.length > 500) throw httpError_('一覧が大きすぎます', 422, 'too_large');
+  const str = (v, max) => String(v ?? '').slice(0, max);
+  const ids = new Set();
+  const tracks = lib.tracks.map((t) => {
+    if (!t || !t.id || ids.has(t.id)) throw httpError_('曲のIDが無いか重複しています: ' + (t && t.id), 422, 'bad_library');
+    if (t.kind !== 'file' && t.kind !== 'youtube') throw httpError_('曲の種類が正しくありません: ' + t.id, 422, 'bad_library');
+    if (t.kind === 'file' && !FILE_RE.test(t.ref)) throw httpError_('曲のファイル名が正しくありません: ' + t.id, 422, 'bad_library');
+    if (t.kind === 'youtube' && !/^[\w-]{11}$/.test(t.ref)) throw httpError_('動画IDが正しくありません: ' + t.id, 422, 'bad_library');
+    ids.add(t.id);
+    const d = Number(t.duration);
+    return { id: str(t.id, 64), kind: t.kind, ref: t.ref, title: str(t.title, 200), artist: str(t.artist, 120), duration: d > 0 ? Math.round(d) : null };
+  });
+  const playlists = lib.playlists.map((p) => {
+    if (!p || !p.id || !Array.isArray(p.trackIds)) throw httpError_('プレイリストの形が正しくありません', 422, 'bad_library');
+    return { id: str(p.id, 64), name: str(p.name, 100) || '名前なし', trackIds: [...new Set(p.trackIds.map(String))].filter((id) => ids.has(id)) };
+  });
+  return { schemaVersion: SCHEMA_VERSION, tracks, playlists };
+}
+
+// ============ GitHub ============
+function gh_(env, path, init = {}) {
+  const repo = env.GH_REPO || 'nagilife5s/crate-library';
+  return fetch(`https://api.github.com/repos/${repo}/${path}`, {
+    ...init,
+    headers: {
+      Authorization: 'Bearer ' + env.GITHUB_TOKEN,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'crate-api',
+      'Cache-Control': 'no-cache',
+      ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+    },
+  });
+}
+async function ghError_(res, what) {
+  const t = await res.text().catch(() => '');
+  if (res.status === 401) return httpError_('GitHub のトークンが無効か期限切れです（作り直して GITHUB_TOKEN を登録し直す）', 502, 'github_auth');
+  if (res.status === 403) return httpError_('GitHub に断られました（権限か回数制限）: ' + t.slice(0, 200), 502, 'github_forbidden');
+  return httpError_(`${what}に失敗しました（GitHub ${res.status}）: ${t.slice(0, 200)}`, 502, 'github');
+}
+function httpError_(msg, status, code) { return Object.assign(new Error(msg), { status, code }); }
+function b64ToUtf8_(b64) {
+  const bin = atob(b64.replace(/\s/g, ''));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+function utf8ToB64_(s) {
+  const bytes = new TextEncoder().encode(s);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
 
 // ============ 曲の中継 ============
 async function streamFile_(request, env, file, params) {
