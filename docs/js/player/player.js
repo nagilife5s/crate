@@ -82,7 +82,11 @@ export class Player extends EventTarget {
     if (!t) return;
     this.audio.unlock();
     if (t.kind === 'file') {
-      if (!this.audio.el.src || this.audio.isSilent) { this.#start(t.id, { gesture: true, startAt: this.time }); return; }
+      // URL の期限が近い・まだ読み込んでいない → 同じ位置から新しい URL で読み込み直す
+      if (!this.audio.el.src || this.audio.isSilent || this.api.needsFreshUrl(t)) {
+        this.#start(t.id, { gesture: true, startAt: this.audio.time || this.time });
+        return;
+      }
       this.status = 'loading';
       this.emit();
       this.audio.play().then(() => this.#setStatus('playing')).catch((e) => {
@@ -118,6 +122,11 @@ export class Player extends EventTarget {
 
   seek(t) {
     if (!this.current) return;
+    if (!this.isYt && this.api.needsFreshUrl(this.current)) {
+      // 期限切れの URL でシークすると新しい要求が 403 になるので、新しい URL で読み込み直す
+      this.#start(this.current.id, { gesture: true, startAt: t, autoplay: this.status === 'playing' || this.status === 'loading' });
+      return;
+    }
     if (this.isYt) this.yt.seek(t); else this.audio.seek(t);
     this.time = t;
     this.emitTime();
@@ -226,10 +235,11 @@ export class Player extends EventTarget {
     this.ctx.index = currentId ? this.ctx.order.indexOf(currentId) : -1;
   }
 
-  async #start(id, { gesture = false, autoplay = true, startAt = 0 } = {}) {
+  async #start(id, { gesture = false, autoplay = true, startAt = 0, isRetry = false } = {}) {
     const t = this.track(id);
     if (!t) { if (autoplay) this.#advance(true); return; }
     const token = ++this._token;
+    if (!isRetry) this._retried = false;
 
     // 画面オフ中は YouTube を飛ばす（設定がオンのとき）
     if (t.kind === 'youtube' && autoplay && !gesture && document.hidden && this.settings.skipYtWhenHidden) {
@@ -345,9 +355,20 @@ export class Player extends EventTarget {
       if (this.status === 'playing') this.#setStatus('paused');
     });
     el.addEventListener('ended', () => { if (!this.isYt && !this.audio.isSilent) this.#advance(true); });
-    el.addEventListener('error', () => {
+    el.addEventListener('error', async () => {
       if (this.isYt || this.audio.isSilent || !this.current || !el.src) return;
-      this.#fail(this.current, 'この曲を再生できませんでした');
+      const t = this.current;
+      // <audio> からは HTTP の状態が見えない。URL の期限切れかもしれないので、取り直して1回だけやり直す
+      if (!this._retried) {
+        this._retried = true;
+        const at = el.currentTime || this.time || 0;
+        const wasPlaying = this.status !== 'paused';
+        try { await this.api.refreshUrls([t.ref]); } catch (e) { /* 下でやり直して、ダメなら再生不可 */ }
+        if (this.current !== t) return;
+        this.#start(t.id, { startAt: at, autoplay: wasPlaying, isRetry: true });
+        return;
+      }
+      this.#fail(t, 'この曲を再生できませんでした');
     });
   }
 

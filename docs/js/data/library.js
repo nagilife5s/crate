@@ -10,6 +10,11 @@ export class Library extends EventTarget {
     this.playlists = [];
     this.byId = new Map();
     this.saveState = 'saved'; // saved | saving | error
+    this.dirty = false;
+    this.saving = false;
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden && this.dirty) this.flush({ keepalive: true });
+    });
   }
 
   async load() {
@@ -41,22 +46,60 @@ export class Library extends EventTarget {
     if (save) this.#queueSave();
   }
 
+  // ---- 保存 ----
+  // ・変更から2秒待ってまとめて保存（並べ替えのたびにコミットが増えすぎないように）
+  // ・同時に送るのは1件だけ。送っている間に変わったら、終わってから最新の状態でもう1回
+  // ・画面が裏に回ったら待たずに送る（iPhone は裏のページをすぐ止めるため）
   #queueSave() {
+    this.dirty = true;
+    this.#setState('saving');
     clearTimeout(this._saveT);
-    this.saveState = 'saving';
-    this.dispatchEvent(new Event('savestate'));
-    this._saveT = setTimeout(async () => {
-      try {
-        const tracks = this.tracks.map(({ unplayable, ...t }) => t); // 実行時だけの印は保存しない
-        await this.api.saveLibrary({ schemaVersion: SCHEMA_VERSION, tracks, playlists: this.playlists });
-        this.saveState = 'saved';
-      } catch (e) {
-        this.saveState = 'error';
-        this.dispatchEvent(new CustomEvent('toast', { detail: '保存できませんでした（' + e.message + '）' }));
-      }
-      this.dispatchEvent(new Event('savestate'));
-    }, 400);
+    this._saveT = setTimeout(() => this.flush(), 2000);
   }
+
+  get hasPending() { return this.dirty || this.saving; }
+
+  async flush({ keepalive = false } = {}) {
+    clearTimeout(this._saveT);
+    if (!this.dirty) return;
+    if (this.saving) { this._again = true; return; }
+    this.saving = true;
+    this.dirty = false;
+    this._again = false;
+    try {
+      const tracks = this.tracks.map(({ unplayable, ...t }) => t); // 実行時だけの印は保存しない
+      const r = await this.api.saveLibrary({ schemaVersion: SCHEMA_VERSION, tracks, playlists: this.playlists }, { keepalive });
+      if (r && r.lib && !this.dirty) {
+        // Mac で足した曲を Worker が足し戻した → その一覧に合わせる
+        const bad = new Set(this.tracks.filter((t) => t.unplayable).map((t) => t.id));
+        this.tracks = r.lib.tracks.map((t) => (bad.has(t.id) ? { ...t, unplayable: true } : t));
+        this.playlists = r.lib.playlists;
+        this.changed({ save: false });
+        if (r.restored) this.#toast(`Mac で追加された曲を ${r.restored} 曲取り込みました`);
+      }
+      this.#setState(this.dirty ? 'saving' : 'saved');
+    } catch (e) {
+      this.dirty = true; // 次の変更か「再試行」でもう一度
+      this.#setState('error');
+      const msg = e.code === 'github_auth' ? 'GitHub のトークンが期限切れです。保存できません'
+        : e.code === 'network' ? '通信できず保存できませんでした'
+        : e.code === 'too_many_removed' ? e.message
+        : '保存できませんでした（' + e.message + '）';
+      if (e.code !== 'unauthorized') this.#toast(msg, { action: '再試行', onAction: () => this.flush() });
+    } finally {
+      this.saving = false;
+      if (this._again || (this.dirty && this.saveState !== 'error')) {
+        clearTimeout(this._saveT);
+        this._saveT = setTimeout(() => this.flush(), 300);
+      }
+    }
+  }
+
+  #setState(s) {
+    this.saveState = s;
+    this.dispatchEvent(new Event('savestate'));
+  }
+  #toast(msg, opts) { this.dispatchEvent(new CustomEvent('toast', { detail: { msg, ...opts } })); }
 
   // ---- 曲 ----
   addYouTube({ videoId, title, artist }) {
@@ -71,12 +114,12 @@ export class Library extends EventTarget {
     Object.assign(t, patch);
     this.changed();
   }
-  /** 長さが分かったときだけ記録（保存はする） */
+  /** 長さが分かったら記録。これだけでは保存しない（次の保存に一緒に乗る） */
   setDuration(id, sec) {
     const t = this.byId.get(id);
     if (!t || !sec || t.duration === Math.round(sec)) return;
     t.duration = Math.round(sec);
-    this.changed();
+    this.changed({ save: false });
   }
   removeTrack(id) {
     this.tracks = this.tracks.filter((t) => t.id !== id);

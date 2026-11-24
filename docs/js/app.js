@@ -509,9 +509,10 @@ function settingsSheet() {
         <button class="switch ${player.settings.skipYtWhenHidden ? 'on' : ''}" id="sw-skip" role="switch" aria-checked="${player.settings.skipYtWhenHidden}"></button></div>
       <div class="act-list">
         <button class="act" id="st-key">${ic('key')}<span>合言葉を入れ直す</span></button>
-        ${api.isMock ? `<button class="act danger" id="st-reset">${ic('reset')}<span>モックのデータを最初に戻す</span></button>` : ''}
+        <button class="act" id="st-reload">${ic('reset')}<span>一覧を読み込み直す（Mac で足した曲を反映）</span></button>
+        ${api.isMock ? `<button class="act danger" id="st-reset">${ic('trash')}<span>モックのデータを最初に戻す</span></button>` : ''}
       </div>
-      <p class="info">Crate ${api.isMock ? 'モック' : ''} v0.1 ・ ${lib.tracks.length}曲 ・ プレイリスト ${lib.playlists.length}</p>`,
+      <p class="info">Crate ${api.isMock ? 'モック' : ''} v0.2 ・ ${lib.tracks.length}曲 ・ プレイリスト ${lib.playlists.length}${api.isMock ? '' : '<br>本番の画面です。モックは URL の末尾に ?mock=1'}</p>`,
     onMount(el, close) {
       const sw = el.querySelector('#sw-skip');
       sw.addEventListener('click', () => {
@@ -521,6 +522,12 @@ function settingsSheet() {
         sw.setAttribute('aria-checked', String(v));
       });
       el.querySelector('#st-key').addEventListener('click', () => { store.del(KEY_STORE); close(); showGate(); });
+      el.querySelector('#st-reload').addEventListener('click', async () => {
+        close();
+        await lib.flush();
+        try { await lib.load(); lib.changed({ save: false }); toast('読み込み直しました'); }
+        catch (e) { toast('読み込めませんでした（' + e.message + '）'); }
+      });
       el.querySelector('#st-reset')?.addEventListener('click', () => {
         api.resetMock();
         store.del('crate.resume');
@@ -617,7 +624,15 @@ function renderAll({ fresh = false } = {}) {
 
 lib.addEventListener('change', () => { renderMain(); renderFull(); renderMini(); renderTop(); });
 lib.addEventListener('savestate', renderTop);
-lib.addEventListener('toast', (e) => toast(e.detail));
+lib.addEventListener('toast', (e) => {
+  const d = e.detail;
+  if (typeof d === 'string') toast(d); else toast(d.msg, d);
+});
+// 合言葉が通らなくなった（変えた・消えた）→ 合言葉画面へ
+window.addEventListener('crate:unauthorized', () => {
+  store.del(KEY_STORE);
+  showGate('合言葉が違うか、変わりました。もう一度入れてください');
+});
 player.addEventListener('change', () => {
   if (!ui.loaded) return;
   if (!player.current && ui.fullOpen) ui.fullOpen = false;
@@ -634,9 +649,12 @@ new ResizeObserver(() => {
 }).observe($('#bottom'));
 
 // ================= 起動 =================
-function showGate() {
+function showGate(msg) {
   const gate = $('#gate');
   gate.hidden = false;
+  const err = $('#gate-err');
+  err.hidden = !msg;
+  if (msg) err.textContent = msg;
   gate.querySelectorAll('.mock-only').forEach((x) => (x.hidden = !api.isMock));
   setTimeout(() => $('#gate-key').focus(), 50);
 }
@@ -645,15 +663,15 @@ $('#gate-form').addEventListener('submit', async (e) => {
   const key = $('#gate-key').value;
   const btn = e.target.querySelector('button');
   btn.disabled = true;
-  let ok = false;
-  try { ok = await api.checkKey(key); } catch { ok = false; }
+  let ok = false, why = '合言葉が違います';
+  try { ok = await api.checkKey(key); } catch (err) { ok = false; why = err.message || '確かめられませんでした'; }
   btn.disabled = false;
-  if (!ok) { $('#gate-err').hidden = false; return; }
+  if (!ok) { $('#gate-err').textContent = why; $('#gate-err').hidden = false; return; }
   store.set(KEY_STORE, key);
   $('#gate-err').hidden = true;
   $('#gate-key').value = '';
   $('#gate').hidden = true;
-  if (!ui.booted) boot();
+  if (!ui.loaded) boot();
 });
 
 async function boot() {
@@ -666,7 +684,10 @@ async function boot() {
     renderAll({ fresh: true });
     player.restore();
   } catch (e) {
-    main.innerHTML = `<div class="empty"><b>読み込めませんでした</b>${esc(e.message)}<br><button class="btn" data-act="retry">もう一度</button></div>`;
+    if (e.code === 'unauthorized') { main.innerHTML = ''; return; } // 合言葉画面が出ている
+    const why = e.code === 'github_auth' ? 'GitHub のトークンが期限切れです。Mac で作り直して登録してください'
+      : e.code === 'network' ? '通信できませんでした。電波を確かめてください' : e.message;
+    main.innerHTML = `<div class="empty"><b>読み込めませんでした</b>${esc(why)}<br><button class="btn" data-act="retry">もう一度</button></div>`;
   }
 }
 
